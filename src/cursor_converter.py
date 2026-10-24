@@ -232,11 +232,6 @@ _INF_KEY_ALIASES: dict[str, str] = {
 
 _XCURSOR_IMAGE_TYPE = 0xFFFD0002
 
-# Windows cursors are drawn on a 32 px canvas for its default size, while Linux
-# desktops default to 24 px. Mapping 32 -> 24 keeps scalable cursors at their
-# original pixel size under the default cursor size.
-_SCALABLE_NOMINAL_RATIO = 3 / 4
-
 
 @dataclass
 class _XcursorFrame:
@@ -744,6 +739,9 @@ class CursorConverter(BaseCursorConverter):
                 continue
             if not frames:
                 continue
+            # GNOME Shell plays every metadata entry as an animation frame, so keep one size.
+            largest = max(frame.size for frame in frames)
+            frames = [frame for frame in frames if frame.size == largest]
 
             target.mkdir(exist_ok=True)
             metadata: list[dict[str, int | str]] = []
@@ -764,7 +762,7 @@ class CursorConverter(BaseCursorConverter):
                     "filename": filename,
                     "hotspot_x": frame.xhot,
                     "hotspot_y": frame.yhot,
-                    "nominal_size": max(1, round(frame.size * _SCALABLE_NOMINAL_RATIO)),
+                    "nominal_size": frame.size,
                 }
                 if len(frames) > 1:
                     entry["delay"] = frame.delay

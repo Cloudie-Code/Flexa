@@ -221,9 +221,30 @@ def test_scalable_cursors_skip_bad_files_and_their_aliases(tmp_path: Path) -> No
         "filename": "arrow-00.svg",
         "hotspot_x": 1,
         "hotspot_y": 2,
-        "nominal_size": 24,
+        "nominal_size": 32,
     }
     assert (scalable_dir / "arrow" / "arrow-00.svg").is_file()
     assert (scalable_dir / "default").resolve() == (scalable_dir / "arrow").resolve()
     assert not (scalable_dir / "wait").exists()
     assert not (scalable_dir / "watch").is_symlink()
+
+
+def test_scalable_cursors_keep_only_the_largest_size(tmp_path: Path) -> None:
+    small = _xcursor_bytes(1, 1, bytes(4), size=24)
+    large = _xcursor_bytes(2, 2, bytes(16), size=48)
+    # Merge both images into one file with a two-entry table of contents
+    header = b"Xcur" + struct.pack("<III", 16, 0x10000, 2)
+    small_image, large_image = small[28:], large[28:]
+    toc = struct.pack("<III", 0xFFFD0002, 24, 40) + struct.pack(
+        "<III", 0xFFFD0002, 48, 40 + len(small_image)
+    )
+    cursors_dir = tmp_path / "cursors"
+    cursors_dir.mkdir()
+    (cursors_dir / "arrow").write_bytes(header + toc + small_image + large_image)
+
+    scalable_dir = tmp_path / "cursors_scalable"
+    _make_converter(tmp_path)._write_scalable_cursors(cursors_dir, scalable_dir)
+
+    [entry] = json.loads((scalable_dir / "arrow" / "metadata.json").read_text(encoding="utf-8"))
+    assert entry["nominal_size"] == 48
+    assert "delay" not in entry
