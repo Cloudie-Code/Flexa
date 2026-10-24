@@ -2,8 +2,11 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import json
+import struct
 import sys
 import types
+import zlib
 from pathlib import Path
 
 # Ensure 'flexa' package can be imported from 'src'
@@ -13,7 +16,12 @@ if "flexa" not in sys.modules:
     _pkg.__path__ = [str(_SRC_DIR)]
     sys.modules["flexa"] = _pkg
 
-from flexa.cursor_converter import CursorConverter, host_path  # noqa: E402
+from flexa.cursor_converter import (  # noqa: E402
+    CursorConverter,
+    _frame_to_png,
+    _read_xcursor_frames,
+    host_path,
+)
 
 
 def _make_converter(output_dir: Path) -> CursorConverter:
@@ -159,3 +167,84 @@ def test_host_path_maps_known_sandbox_icon_paths() -> None:
         host_path("/home/caue/custom/icons")
         == "/home/caue/custom/icons"
     )
+
+
+def _xcursor_bytes(width: int, height: int, pixels: bytes, *, size: int = 32) -> bytes:
+    header = b"Xcur" + struct.pack("<III", 16, 0x10000, 1)
+    toc = struct.pack("<III", 0xFFFD0002, size, 28)
+    image = struct.pack("<9I", 36, 0xFFFD0002, size, 1, width, height, 1, 2, 50)
+    return header + toc + image + pixels
+
+
+def test_read_xcursor_frames_and_png_unpremultiply(tmp_path: Path) -> None:
+    # 2x1 premultiplied BGRA: opaque red, then half-transparent white
+    cursor = tmp_path / "arrow"
+    cursor.write_bytes(_xcursor_bytes(2, 1, bytes((0, 0, 255, 255, 128, 128, 128, 128))))
+
+    [frame] = _read_xcursor_frames(cursor)
+    assert (frame.size, frame.width, frame.height) == (32, 2, 1)
+    assert (frame.xhot, frame.yhot, frame.delay) == (1, 2, 50)
+
+    png = _frame_to_png(frame)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", png[16:24]) == (2, 1)
+    idat_len = struct.unpack(">I", png[33:37])[0]
+    rows = zlib.decompress(png[41 : 41 + idat_len])
+    assert rows == bytes((0, 255, 0, 0, 255, 255, 255, 255, 128))
+
+
+def test_read_xcursor_frames_rejects_truncated_pixels(tmp_path: Path) -> None:
+    cursor = tmp_path / "arrow"
+    cursor.write_bytes(_xcursor_bytes(2, 2, bytes(4)))
+
+    try:
+        _read_xcursor_frames(cursor)
+    except ValueError as err:
+        assert "truncated" in str(err)
+    else:
+        raise AssertionError("truncated cursor was accepted")
+
+
+def test_scalable_cursors_skip_bad_files_and_their_aliases(tmp_path: Path) -> None:
+    cursors_dir = tmp_path / "cursors"
+    cursors_dir.mkdir()
+    (cursors_dir / "arrow").write_bytes(_xcursor_bytes(1, 1, bytes((0, 0, 0, 255))))
+    (cursors_dir / "default").symlink_to("arrow")
+    (cursors_dir / "wait").write_bytes(_xcursor_bytes(2, 2, bytes(4)))
+    (cursors_dir / "watch").symlink_to("wait")
+
+    scalable_dir = tmp_path / "cursors_scalable"
+    _make_converter(tmp_path)._write_scalable_cursors(cursors_dir, scalable_dir)
+
+    [entry] = json.loads((scalable_dir / "arrow" / "metadata.json").read_text(encoding="utf-8"))
+    assert entry == {
+        "filename": "arrow-00.svg",
+        "hotspot_x": 1,
+        "hotspot_y": 2,
+        "nominal_size": 32,
+    }
+    assert (scalable_dir / "arrow" / "arrow-00.svg").is_file()
+    assert (scalable_dir / "default").resolve() == (scalable_dir / "arrow").resolve()
+    assert not (scalable_dir / "wait").exists()
+    assert not (scalable_dir / "watch").is_symlink()
+
+
+def test_scalable_cursors_keep_only_the_largest_size(tmp_path: Path) -> None:
+    small = _xcursor_bytes(1, 1, bytes(4), size=24)
+    large = _xcursor_bytes(2, 2, bytes(16), size=48)
+    # Merge both images into one file with a two-entry table of contents
+    header = b"Xcur" + struct.pack("<III", 16, 0x10000, 2)
+    small_image, large_image = small[28:], large[28:]
+    toc = struct.pack("<III", 0xFFFD0002, 24, 40) + struct.pack(
+        "<III", 0xFFFD0002, 48, 40 + len(small_image)
+    )
+    cursors_dir = tmp_path / "cursors"
+    cursors_dir.mkdir()
+    (cursors_dir / "arrow").write_bytes(header + toc + small_image + large_image)
+
+    scalable_dir = tmp_path / "cursors_scalable"
+    _make_converter(tmp_path)._write_scalable_cursors(cursors_dir, scalable_dir)
+
+    [entry] = json.loads((scalable_dir / "arrow" / "metadata.json").read_text(encoding="utf-8"))
+    assert entry["nominal_size"] == 48
+    assert "delay" not in entry
