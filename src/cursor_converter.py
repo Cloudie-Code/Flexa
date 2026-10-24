@@ -263,6 +263,8 @@ def _read_xcursor_frames(path: Path) -> list[_XcursorFrame]:
             "<9I", data, pos
         )
         pixels = data[pos + 36 : pos + 36 + width * height * 4]
+        if not width or not height or len(pixels) != width * height * 4:
+            raise ValueError(f"truncated image chunk in {path.name}")
         frames.append(_XcursorFrame(size, width, height, xhot, yhot, delay, pixels))
     return frames
 
@@ -726,11 +728,11 @@ class CursorConverter(BaseCursorConverter):
         """
         scalable_dir.mkdir(parents=True, exist_ok=True)
 
+        aliases: list[Path] = []
         for source in sorted(cursors_dir.iterdir()):
             target = scalable_dir / source.name
             if source.is_symlink():
-                if not target.exists() and not target.is_symlink():
-                    target.symlink_to(os.readlink(source))
+                aliases.append(source)
                 continue
             if not source.is_file():
                 continue
@@ -769,6 +771,13 @@ class CursorConverter(BaseCursorConverter):
                 metadata.append(entry)
 
             (target / "metadata.json").write_text(json.dumps(metadata, indent=1), encoding="utf-8")
+
+        # Aliases go last so a link is made only when its primary cursor was written.
+        for source in aliases:
+            target = scalable_dir / source.name
+            link = os.readlink(source)
+            if (scalable_dir / link).is_dir() and not target.exists() and not target.is_symlink():
+                target.symlink_to(link)
 
     def _write_index_theme(self, out_theme: Path, name: str) -> None:
         (out_theme / "index.theme").write_text(
